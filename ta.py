@@ -1,4 +1,4 @@
-import yfinance as yf
+
 
 # Import the IB modules
 
@@ -9,20 +9,23 @@ from ibapi.account_summary_tags import AccountSummaryTags
 from ibapi.common import *
 from ibapi.ticktype import *
 from ibapi.order import *
+from ib_insync import *
+
 
 
 # Import classic modules
 
-import openai
+
 import requests
 import exchange
 import json
 import time
-import datetime
+from datetime import datetime, timedelta
 import logging
 import uuid
 import numpy as np
 import ta
+import matplotlib.pyplot as plt
 import pandas as pd
 import threading
 import pandas_datareader.data as web
@@ -44,49 +47,64 @@ from keras.optimizers import Adam
 
 # Import the dataset module
 
-from alpha_vantage.foreignexchange import ForeignExchange
-from alpha_vantage.timeseries import TimeSeries
-
-
-# Initialize Alpha Vantage API key
-
-alphavantage_api_key = 'QUJ00N0C3VLU7NKC'
-
-
+from ib_insync import IB, Forex, Stock, util
 
 class Market:
-    def __init__(self, symbol, yahoo_ticker, currency='EURUSD', hist_window=365):
-        self.symbol = symbol
-        self.yahoo_ticker = yahoo_ticker
-        self.currency = currency
-        self.hist_window = hist_window
+    def __init__(self):
+        self.ib = IB()
+        self.connect_to_tws()
+    def connect_to_tws(self):
+        try:
 
-    def fx_price(self, real_time=True):
-        if real_time:
-            fx = ForeignExchange(key=alphavantage_api_key, output_format='pandas')
-            data, meta_data = fx.get_currency_exchange_rate(from_currency='EUR', to_currency='USD')
-            price = data['5. Exchange Rate'][0]
+            self.ib.connect("127.0.0.1", 7495, clientId=1)  
+           
+
+            if self.ib.isConnected():
+                print("Connected to TWS")
+            else:
+                print("Connection to TWS failed")
+
+        except Exception as e:
+            print(f"Error connecting to TWS: {e}")
+
+    def get_historical_data(self, symbol, duration, bar_size, end_datetime=None):
+        if '.' in symbol:
+            contract = Forex(symbol)
         else:
-            fx = ForeignExchange(key=alphavantage_api_key, output_format='pandas')
-            data, meta_data = fx.get_currency_exchange_daily(from_symbol='EUR', to_symbol='USD', outputsize='compact')
-            price = data['4. close'][-1]
-        price = float(price)
-        print(f"EURUSD Current Spot: {price}")
+            contract = Stock(symbol, 'MKT', 'EUR')
 
-        return price
+        request = self.ib.reqHistoricalData(
+            contract,
+            endDateTime=end_datetime,
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=1
+        )
 
-    def stock_price(self):
-        msft = yf.Ticker('MSFT')
-        hist_data = msft.history(period='max')
-        hist_data = hist_data[['Close']]
-        print(f"MSFT Historical Price: {hist_data['Close'].values[-1]}")
+        util.waitUntil(lambda: len(request) > 0)
 
-        # Get real-time data for the given stock symbol
-        msft_info = msft.info
-        current_price = msft_info["regularMarketOpen"]
-        print(f"MSFT Current Price: {current_price}")
+        df = util.df(request)
 
-        return hist_data, current_price 
+        return df
+
+    def get_real_time_data(self, symbol):
+        if '.' in symbol:
+            contract = Forex(symbol)
+        else:
+            contract = Stock(symbol, 'SMART', 'USD')
+
+        self.ib.reqMktData(contract, '', False, False)
+        self.ib.sleep(5)
+
+        ticker = self.ib.ticker(contract)
+        self.ib.cancelMktData(contract)
+
+        return ticker
+
+
+
 
 
         
@@ -99,13 +117,18 @@ class IBapi(EWrapper, EClient):
         self.bot = bot
 
 
-class BalanceApp(EWrapper, EClient):
+class BalanceApp(EWrapper, EClient, float):
+    
     def __init__(self, ip_address, port_id, client_id):
         EClient.__init__(self, self)
         self.ip_address = ip_address
         self.port_id = port_id
         self.client_id = client_id
         self.account_balance = None
+    
+    def __new__(cls, ip_address, port_id, client_id):
+        return float.__new__(cls, 0.0)
+    
 
     def start(self):
         self.connect(self.ip_address, self.port_id, self.client_id)
@@ -121,29 +144,47 @@ class BalanceApp(EWrapper, EClient):
         if tag == 'TotalCashValue':
             self.account_balance = float(value)
 
+    def __float__(self):
+        if self.account_balance:
+            return float(self.account_balance)
+        else:
+            return 0.0
 
     def error(self, reqId, errorCode, errorString):
         print(f"Error: {reqId} - {errorCode} - {errorString}")
-        if errorCode == 2104:  # Market data farm connection is OK
-            return  # Ignore this error
+        if errorCode == 2104:  
+            return
+
+        
 
 
 
 
 
 class RiskManager:
-    
-    def __init__(self, balance, stop_loss_pct):
-        self.balance = balance
+    def __init__(self, balance, max_loss_pct, stop_loss_pct, take_profit_pct):
+        self.balance = balance  # This is the BalanceApp instance
+        self.max_loss_pct = max_loss_pct
         self.stop_loss_pct = stop_loss_pct
-        self.max_loss_pct = 0.05  # maximum percentage of account balance that can be lost on a single trade
+        self.take_profit_pct = take_profit_pct
+        self.max_loss_pct = 0.04  # maximum percentage of account balance that can be lost on a single trade
         self.take_profit_pct = self.calculate_max_take_profit_pct()
         
     def calculate_max_take_profit_pct(self):
-        return self.max_loss_pct / (1 - self.stop_loss_pct)
+        # Fetch the balance from the BalanceApp instance and convert it to a float
+        actual_balance = float(self.balance)
         
+        return self.max_loss_pct / (1 - self.stop_loss_pct)
+
     def calculate_order_size(self, current_price):
-        risk_amount = self.balance * self.max_loss_pct
+        
+        if not isinstance(self.balance, (int, float)):
+            raise ValueError("Balance must be a numeric value")
+        
+        if not isinstance(self.max_loss_pct, float):
+            raise TypeError("Max loss percentage must be a float")
+        
+        risk_amount = float(self.balance) * self.max_loss_pct
         stop_loss_price = current_price * (1 - self.stop_loss_pct)
         take_profit_price = current_price * (1 + self.take_profit_pct)
         
@@ -155,6 +196,7 @@ class RiskManager:
             order_size = risk_amount / (take_profit_price - current_price)
             
         return int(order_size)
+
         
     def calculate_risk(self, price, stop_loss):
         risk = self.balance * self.max_loss_pct
@@ -162,6 +204,8 @@ class RiskManager:
         position_size = risk / max_loss
 
         return position_size
+    
+
 
 
 
@@ -176,7 +220,7 @@ class NNTS:
         self.epochs = epochs
         self.batch_size = batch_size
         self.scaler = MinMaxScaler()
-        self.risk_manager = RiskManager(balance=150, stop_loss_pct=0.05)
+        self.risk_manager = RiskManager(balance=BalanceApp(ip_address="127.0.0.1", port_id=7495, client_id=1), stop_loss_pct=0.03, max_loss_pct=0.04, take_profit_pct=0.05)
 
     def _prepare_data(self, data):
         self.scaler.fit(data)
@@ -217,21 +261,19 @@ class NNTS:
         signals = np.zeros(len(data))
         signals[self.lookback:] = np.where(y_pred > y, 1, -1)
         signals = self.risk_manager.filter_signals(signals, data)
-        
+
         if strategy == 'buy':
             signals[signals != 1] = 0
         elif strategy == 'sell':
             signals[signals != -1] = 0
-        else:
-            signals = np.zeros(len(data))
-            
+
         if np.count_nonzero(signals) > max_trades:
             excess_trades = np.count_nonzero(signals) - max_trades
             if excess_trades < np.count_nonzero(signals == 1):
                 signals[signals == 1][:excess_trades] = 0
             else:
                 signals[signals == -1][:excess_trades] = 0
-                
+
         return signals
 
 
@@ -239,10 +281,9 @@ class NNTS:
 
 
 class TradingProcess:
-    def __init__(self, balance, risk_percentage, transaction_fee):
+    def __init__(self, balance, risk_percentage):
         self.balance = balance
         self.risk_percentage = risk_percentage
-        self.transaction_fee = transaction_fee
         self.scaler = StandardScaler()
         self.model = MLPClassifier(hidden_layer_sizes=(64, 32), activation='relu', max_iter=500, random_state=42)
 
@@ -260,7 +301,7 @@ class TradingProcess:
         position_size = self.calculate_risk(price, stop_loss)
         return self.balance >= position_size * price
 
-    def can_afford_position(self, price, stop_loss, size):
+    def can_afford_position(self, price, size):
         position_cost = size * price
         return self.balance >= position_cost
 
@@ -273,19 +314,29 @@ class TradingProcess:
             'profit': 0.0
         })
 
-    def close_position(self, index, price):
-        position = self.positions.pop(index)
-        profit = position['size'] * (price - position['price']) - 2 * self.transaction_fee
-        self.balance += profit
-        self.profits.append(profit)
-        return profit
+    def close_position(self, index, price, current_signal):
+        position = self.positions[index]
+    
+    # Check if the current signal is opposite to the signal at the time of opening the position
+        if (current_signal == 'buy' and position['signal'] == 'sell') or \
+        (current_signal == 'sell' and position['signal'] == 'buy'):
+            profit = position['size'] * (price - position['price'])
+            self.balance += profit
+            self.profits.append(profit)
+            self.positions.pop(index)
+            return profit
+        else:
+        # Position remains open if signals are not opposite
+            position['profit'] = position['size'] * (price - position['price'])
+            return position['profit']
+
 
     def update_position(self, index, price):
         position = self.positions[index]
         if price <= position['stop_loss']:
             return self.close_position(index, position['stop_loss'])
         else:
-            position['profit'] = position['size'] * (price - position['price']) - 2 * self.transaction_fee
+            position['profit'] = position['size'] * (price - position['price'])
             return position['profit']
 
     def fit(self, X, y):
@@ -340,9 +391,9 @@ class PlaceCancelOrder:
         self.units = None
 
 
-    def place_order(self, signal, symbol, order_type):
+    def place_order(self, buy_signals, sell_signals, symbol, order_type):
         self.units = self.calculate_units()
-        if signal == 'buy':
+        if buy_signals == 'buy':
             self.orders.append({'side': 'buy',
                                 'units': self.units,
                                 'strategy': 'NNTS',
@@ -350,7 +401,7 @@ class PlaceCancelOrder:
                                 'type': order_type,
                                 'stop_loss': self.stop_loss,
                                 'take_profit': self.take_profit})
-        elif signal == 'sell':
+        elif sell_signals == 'sell':
             self.orders.append({'side': 'sell',
                                 'units': self.units,
                                 'strategy': 'NNTS',
@@ -387,7 +438,7 @@ class Bot:
     def connectAck(self):
         print("Connected to TWS")
 
-    def execute_trade(self, side, quantity, price):
+    def execute_trade(self, buy_signals, sell_signals, quantity, price):
         # create a new contract object
         print("execute")
         print("execute trade")
@@ -398,13 +449,13 @@ class Bot:
         contract.exchange = "MKT"  
 
         order = Order() 
-        if side == 'BUY':
+        if buy_signals == 'BUY':
             order.action = 'BUY'
-        if side == 'SELL':
+        if sell_signals == 'SELL':
             order.action = 'SELL'
-        order.orderType = 'MKT'  # "LMT" for limit order, "MKT" for market order
+        order.orderType = 'MKT' 
         order.totalQuantity = quantity
-        order.lmtPrice = price  # specify the price for limit orders
+        order.lmtPrice = price 
     
         # submit the order to the TWS
         self.ib.placeOrder(self.ib.nextOrderId, contract, order)
@@ -439,77 +490,119 @@ class Bot:
     def run_loop(self):
         self.ib.run()
 
+    def disconnect(self):
+        if self.ib.isConnected():
+            self.ib.disconnect()
+            print("Disconnected from TWS")
 
 
 
 
-# Run the loop
+
+#run loop
+
 print("test 1")
-bot = Bot()
-print("test 2")    
 
-# Call Market class
+if __name__ == "__main__":
+    try:
+        market = Market()
+        
+        msft_historical_data = market.get_historical_data('MSFT', '1 Y', '1 day')
+        msft_real_time_data = market.get_real_time_data('MSFT')
+        eurusd_historical_data = market.get_historical_data('EUR.USD', '1 Y', '1 day')
+        eurusd_real_time_data = market.get_real_time_data('EUR.USD')
+    
+    except ConnectionError as e:
+        print(f"Erreur de connexion : {e}")
 
-market = Market(symbol='EURUSD', yahoo_ticker='MSFT')
-market.fx_price()
-market.stock_price()
 
-# Call the Balance class
+
 ip_address = "127.0.0.1" 
 port_id = 7495 
 client_id = 1  
 current_price=market.fx_price(real_time= True)
-price=market.fx_price()
+print(current_price);
+price=eurusd_historical_data, eurusd_real_time_data
+data=price
+bot = Bot()
 
 
-bot.nextorderId = None
-bot.run_loop();
 print("wa7el Houni");
 balance = BalanceApp(ip_address,port_id,client_id)
 balance.start()
 balance.accountSummary(reqId=123, account="DU11643091", tag="TotalCashValue", value="12345", currency="EUR")
+balance.__float__()
 balance.error(reqId=123, errorCode=456, errorString="Some error message")
+
+print('Is balance a float?', isinstance(balance, float))
+
+print("test 5")
 
 # Call the RiskManager class
 
-riskmg = RiskManager(balance=150, stop_loss_pct=0.05)
+
+riskmg = RiskManager(balance=BalanceApp(ip_address, port_id, client_id), max_loss_pct=0.04, stop_loss_pct=0.03, take_profit_pct=0.05)
 max_take_profit_pct = riskmg.calculate_max_take_profit_pct()
 print("Maximum take profit pct: ", max_take_profit_pct)
 order_size=riskmg.calculate_order_size(current_price)
 print("Order size:", order_size)
-riskmg.calculate_risk(price, stop_loss=7.5)
+riskmg.calculate_risk(price, stop_loss=0.04)
+print("test 6")
 
 # Call the NNTS class
 
 nnts = NNTS(lookback=50, units=128, dropout=0.5, epochs=200, batch_size=64)
-nnts._prepare_data()
-nnts._build_model()
-nnts.generate_signals()
+X, y=nnts._prepare_data(data)
+model=nnts._build_model(X)
+buy_signals=nnts.generate_signals(data, strategy='buy')
+sell_signals=nnts.generate_signals(data, strategy='sell')
+print("test 7")
 
 # Call the TradingProcess class
 
-tp = TradingProcess()
+tp = TradingProcess(balance, risk_percentage=0.05)
 tp.update_equity()
-tp.can_open_position()
-tp.can_afford_position()
-tp.open_position()
-tp.close_position()
-tp.update_position()
-tp.fit()
-tp.predict()
+tp.can_open_position(price, stop_loss=0.04)
+tp.can_afford_position(price)
+tp.open_position(price, stop_loss=0.04)
+tp.close_position(price)
+tp.update_position(price)
+tp.fit(X, y)
+tp.predict(X)
+print("test 8")
 
 # Call the DataProcessor class
 
-datapp = DataProcessor()
-datapp.preprocess_data()
-
+datapp = DataProcessor(feature_collumns=["open","high", "low", "close", "volume"])
+datapp.preprocess_data(data)
+print("test 9")
 
 # Call PlaceCancelOrder class
 
 pcorder = PlaceCancelOrder()
-pcorder.place_order()
-pcorder.cancel_order()
+pcorder.place_order(buy_signals, sell_signals, symbol='EURUSD', order_type='MKT')
+pcorder.cancel_order(order_id=1)
+print("test 10")
 
 # Call Bot function
-bot.execute_trade()
+bot.connectAck()
+bot.execute_trade(buy_signals, sell_signals, price)
 
+
+
+timestamps = np.arange(len(buy_signals, sell_signals, price))
+plt.figure(figsize=(12,6))
+plt.plot(timestamps, buy_signals, 'g^', label='Buy Signals', marketsize=8, markerfacecolor='none')
+plt.plot(timestamps, sell_signals, 'rs', label='Sell Signals', marketsize=8, markerfacecolor='none')
+plt.plot(timestamps, price, label='Price', marketsize=8, color='black', linewidth=2)
+plt.xlabel('Timestamp')
+plt.ylabel('Price')
+plt.title('Signals vs Price')
+plt.grid(True)
+plt.legend()
+
+plt.show()
+
+print("test 11")
+
+bot.disconnect()
